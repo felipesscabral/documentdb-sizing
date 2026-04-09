@@ -1,9 +1,10 @@
 # collect_documentdb_sizing.sh
 
-Script bash para coleta completa de métricas de sizing de clusters **Amazon DocumentDB**, com foco em subsidiar processos de migração e dimensionamento para **MongoDB Atlas**.
+Script bash de código aberto, disponibilizado exclusivamente como exemplo, para coleta completa de métricas de sizing de clusters Amazon DocumentDB, com foco em subsidiar processos de migração e dimensionamento para MongoDB Atlas.
 
-Combina **AWS CLI v2** (descoberta de clusters e métricas CloudWatch) com **mongosh** (coleta interna de databases, collections e índices) — sem dependências adicionais além dessas ferramentas.
+Combina AWS CLI v2 — para descoberta de clusters e coleta de métricas no CloudWatch — com mongosh — para coleta interna de databases, collections e índices — sem dependências adicionais além dessas ferramentas.
 
+Este material é fornecido apenas para fins de referência. Sua utilização, adaptação e execução são de inteira responsabilidade do usuário. Os desenvolvedores e mantenedores deste código não assumem qualquer responsabilidade por problemas, falhas, impactos, perdas ou danos decorrentes de seu uso, inclusive em ambientes de teste ou produção.
 ---
 
 ## O que é coletado
