@@ -1,8 +1,13 @@
 #!/bin/bash
 # =============================================================================
-# collect_documentdb_sizing.sh
+# collect_documentdb_sizing
 # Coleta informações de sizing de clusters Amazon DocumentDB
 # Requisitos: aws cli v2, mongosh (ou mongo), jq
+#
+# Modos de conectividade (automático):
+#   - Direto : quando a máquina tem acesso de rede ao DocumentDB (VPN / EC2 na VPC)
+#   - Túnel  : quando EC2_INSTANCE_ID está definido, abre túnel SSM transparente
+#              (requer session-manager-plugin instalado localmente)
 # =============================================================================
 
 set -euo pipefail
@@ -15,18 +20,22 @@ OUTPUT_DIR="./docdb_sizing_$(date +%Y%m%d_%H%M%S)"
 REPORT_FILE="$OUTPUT_DIR/sizing_report.json"
 CSV_FILE="$OUTPUT_DIR/sizing_summary.csv"
 
-# Credenciais do DocumentDB (serão preenchidas via AWS Secrets Manager ou manual)
 DOCDB_USER="${DOCDB_USER:-}"
 DOCDB_PASS="${DOCDB_PASS:-}"
 TLS_CA_FILE="${TLS_CA_FILE:-/tmp/global-bundle.pem}"
+
+# Opcional: ID de instância EC2 na VPC para túnel SSM automático
+# Deixe vazio se tiver acesso direto (VPN, EC2, etc.)
+EC2_INSTANCE_ID="${EC2_INSTANCE_ID:-}"
+SSM_TUNNEL_BASE_PORT="${SSM_TUNNEL_BASE_PORT:-47017}"
 
 mkdir -p "$OUTPUT_DIR"
 
 # ---------------------------------------------------------------------------
 # FUNÇÕES UTILITÁRIAS
 # ---------------------------------------------------------------------------
-log()  { echo "[$(date +%H:%M:%S)] $*"; }
-die()  { echo "ERRO: $*" >&2; exit 1; }
+log() { echo "[$(date +%H:%M:%S)] $*"; }
+die() { echo "ERRO: $*" >&2; exit 1; }
 
 command -v aws     >/dev/null 2>&1 || die "aws cli não encontrado"
 command -v mongosh >/dev/null 2>&1 || command -v mongo >/dev/null 2>&1 || die "mongosh/mongo não encontrado"
@@ -34,8 +43,19 @@ command -v jq      >/dev/null 2>&1 || die "jq não encontrado"
 
 MONGO_BIN=$(command -v mongosh 2>/dev/null || command -v mongo)
 
+# Valida session-manager-plugin apenas se for usar túnel
+if [[ -n "$EC2_INSTANCE_ID" ]]; then
+  command -v session-manager-plugin >/dev/null 2>&1 || \
+    die "EC2_INSTANCE_ID definido mas session-manager-plugin não encontrado.
+  Instale com: brew install --cask session-manager-plugin
+  Docs: https://docs.aws.amazon.com/systems-manager/latest/userguide/session-manager-working-with-install-plugin.html"
+  log "Modo: túnel SSM via EC2 $EC2_INSTANCE_ID"
+else
+  log "Modo: conexão direta ao endpoint DocumentDB"
+fi
+
 # ---------------------------------------------------------------------------
-# BAIXA O CERTIFICADO TLS DA AWS (se necessário)
+# CERTIFICADO TLS
 # ---------------------------------------------------------------------------
 if [[ ! -f "$TLS_CA_FILE" ]]; then
   log "Baixando certificado TLS global da AWS..."
@@ -43,7 +63,46 @@ if [[ ! -f "$TLS_CA_FILE" ]]; then
 fi
 
 # ---------------------------------------------------------------------------
-# DESCOBRE TODOS OS CLUSTERS DOCUMENTDB NA REGIÃO
+# GERENCIAMENTO DE TÚNEIS SSM
+# ---------------------------------------------------------------------------
+TUNNEL_PIDS=()
+
+cleanup_tunnels() {
+  if [[ ${#TUNNEL_PIDS[@]} -gt 0 ]]; then
+    log "Encerrando túneis SSM..."
+    for pid in "${TUNNEL_PIDS[@]}"; do
+      kill "$pid" 2>/dev/null || true
+    done
+  fi
+}
+trap cleanup_tunnels EXIT INT TERM
+
+# Abre túnel SSM e retorna a porta local. Uso: open_tunnel <endpoint> <port>
+open_tunnel() {
+  local endpoint="$1"
+  local remote_port="$2"
+  local local_port="$3"
+
+  aws ssm start-session \
+    --region "$AWS_REGION" \
+    --target "$EC2_INSTANCE_ID" \
+    --document-name "AWS-StartPortForwardingSessionToRemoteHost" \
+    --parameters "{\"host\":[\"$endpoint\"],\"portNumber\":[\"$remote_port\"],\"localPortNumber\":[\"$local_port\"]}" \
+    >"$OUTPUT_DIR/ssm_tunnel_$(basename "$endpoint").log" 2>&1 &
+
+  local pid=$!
+  TUNNEL_PIDS+=("$pid")
+  sleep 6  # aguarda túnel estabilizar
+
+  if ! kill -0 "$pid" 2>/dev/null; then
+    log "  AVISO: túnel SSM falhou — veja $OUTPUT_DIR/ssm_tunnel_$(basename "$endpoint").log"
+    return 1
+  fi
+  echo "$pid"
+}
+
+# ---------------------------------------------------------------------------
+# DESCOBRE CLUSTERS DOCUMENTDB
 # ---------------------------------------------------------------------------
 log "Listando clusters DocumentDB na região $AWS_REGION..."
 
@@ -55,10 +114,11 @@ CLUSTERS=$(aws docdb describe-db-clusters \
 CLUSTER_COUNT=$(echo "$CLUSTERS" | jq 'length')
 log "Encontrado(s) $CLUSTER_COUNT cluster(s)."
 
-# Se não tiver usuário ainda, tenta buscar do Secrets Manager
+# ---------------------------------------------------------------------------
+# CREDENCIAIS VIA SECRETS MANAGER
+# ---------------------------------------------------------------------------
 fetch_credentials() {
   local cluster_id="$1"
-  # Tenta padrão de nome de secret: docdb/<cluster-id>/credentials
   local secret_id="docdb/${cluster_id}/credentials"
   log "Buscando credenciais no Secrets Manager: $secret_id"
   local secret
@@ -71,12 +131,11 @@ fetch_credentials() {
 }
 
 # ---------------------------------------------------------------------------
-# SCRIPT JAVASCRIPT EXECUTADO DENTRO DO MONGOSH
-# Coleta: databases, collections, índices, tamanhos, cardinalidade
+# SCRIPT JAVASCRIPT — coleta databases, collections, índices e tamanhos
 # ---------------------------------------------------------------------------
 MONGO_SCRIPT=$(cat <<'JSEOF'
-// Retorna todos os dados de sizing em JSON
 var result = { clusters_ts: new Date().toISOString(), databases: [] };
+var MB = 1024 * 1024;
 
 var adminDbs = db.adminCommand({ listDatabases: 1 });
 adminDbs.databases.forEach(function(dbInfo) {
@@ -84,72 +143,59 @@ adminDbs.databases.forEach(function(dbInfo) {
   if (["admin","local","config","system"].indexOf(dbName) !== -1) return;
 
   var targetDb  = db.getSiblingDB(dbName);
-  var dbStats   = targetDb.stats(1024 * 1024); // em MB
+  // stats() sem parâmetro de scale — DocumentDB ignora o argumento,
+  // então dividimos manualmente para obter MB corretos.
+  var dbStats   = targetDb.stats();
   var collNames = targetDb.getCollectionNames();
 
   var dbEntry = {
     name:          dbName,
-    size_mb:       dbStats.dataSize   || 0,
-    storage_mb:    dbStats.storageSize || 0,
-    index_size_mb: dbStats.indexSize  || 0,
+    // DocumentDB não retorna dataSize; storageSize usado como fallback
+    size_mb:       (dbStats.dataSize || dbStats.storageSize || 0) / MB,
+    storage_mb:    (dbStats.storageSize || 0) / MB,
+    index_size_mb: (dbStats.indexSize  || 0) / MB,
     collections:   []
   };
 
   collNames.forEach(function(collName) {
     var coll      = targetDb.getCollection(collName);
-    var collStats = coll.stats(1024 * 1024);
+    var collStats = coll.stats();
     var indexes   = coll.getIndexes();
     var indexDetails = [];
 
     indexes.forEach(function(idx) {
-      // Tamanho individual de cada índice via $indexStats (DocumentDB compat.)
-      var idxSizeMb = 0;
-      try {
-        var idxStats = coll.aggregate([
-          { $indexStats: {} },
-          { $match: { name: idx.name } }
-        ]).toArray();
-        if (idxStats.length > 0 && idxStats[0].host) {
-          // tamanho não disponível diretamente no $indexStats; usa proporção
-        }
-      } catch(e) {}
-
-      // Desmonta o objeto key em arrays legíveis
-      // ex: { status: 1, createdAt: -1 }  →  fields: ["status","createdAt"]
-      //                                       directions: ["ASC","DESC"]
-      var fields     = [];
-      var directions = [];
+      var fields = [], directions = [];
       Object.keys(idx.key).forEach(function(field) {
         fields.push(field);
         var dir = idx.key[field];
-        if      (dir ===  1)        directions.push("ASC");
-        else if (dir === -1)        directions.push("DESC");
+        if      (dir ===  1)         directions.push("ASC");
+        else if (dir === -1)         directions.push("DESC");
         else if (dir === "2dsphere") directions.push("2dsphere");
-        else if (dir === "text")    directions.push("text");
-        else                        directions.push(String(dir));
+        else if (dir === "text")     directions.push("text");
+        else                         directions.push(String(dir));
       });
 
       indexDetails.push({
-        name:             idx.name,
-        fields:           fields,           // ["campo1","campo2"]
-        directions:       directions,        // ["ASC","DESC"]
-        fields_str:       fields.join(" | "),      // "campo1 | campo2"
-        composition_str:  fields.map(function(f,i){ return f+":"+directions[i]; }).join(", "),
-        unique:           idx.unique   || false,
-        sparse:           idx.sparse   || false,
-        background:       idx.background || false,
-        expireAfterSeconds:         idx.expireAfterSeconds || null,
-        partialFilterExpression:    idx.partialFilterExpression || null
+        name:                    idx.name,
+        fields:                  fields,
+        directions:              directions,
+        fields_str:              fields.join(" | "),
+        composition_str:         fields.map(function(f,i){ return f+":"+directions[i]; }).join(", "),
+        unique:                  idx.unique    || false,
+        sparse:                  idx.sparse    || false,
+        background:              idx.background || false,
+        expireAfterSeconds:      idx.expireAfterSeconds      || null,
+        partialFilterExpression: idx.partialFilterExpression || null
       });
     });
 
     dbEntry.collections.push({
       name:          collName,
-      doc_count:     collStats.count        || 0,
-      size_mb:       collStats.size         || 0,
-      avg_doc_kb:    collStats.avgObjSize   ? (collStats.avgObjSize / 1024).toFixed(2) : 0,
-      storage_mb:    collStats.storageSize  || 0,
-      index_size_mb: collStats.totalIndexSize || 0,
+      doc_count:     collStats.count          || 0,
+      size_mb:       (collStats.size          || 0) / MB,
+      avg_doc_kb:    collStats.avgObjSize ? (collStats.avgObjSize / 1024).toFixed(2) : 0,
+      storage_mb:    (collStats.storageSize   || 0) / MB,
+      index_size_mb: (collStats.totalIndexSize || 0) / MB,
       index_count:   indexes.length,
       indexes:       indexDetails
     });
@@ -165,72 +211,126 @@ JSEOF
 # ---------------------------------------------------------------------------
 # ITERA SOBRE CADA CLUSTER
 # ---------------------------------------------------------------------------
-ALL_RESULTS="[]"
+LOCAL_PORT=$SSM_TUNNEL_BASE_PORT
+CLUSTER_FILES=()
 
-echo "$CLUSTERS" | jq -c '.[]' | while IFS= read -r cluster_row; do
-  CLUSTER_ID=$(echo "$cluster_row" | jq -r '.[0]')
-  ENDPOINT=$(echo   "$cluster_row" | jq -r '.[1]')
-  PORT=$(echo       "$cluster_row" | jq -r '.[2]')
-  ENGINE_VER=$(echo "$cluster_row" | jq -r '.[3]')
-  MULTI_AZ=$(echo   "$cluster_row" | jq -r '.[4]')
+while IFS= read -r cluster_row; do
+  CLUSTER_ID=$(echo  "$cluster_row" | jq -r '.[0]')
+  ENDPOINT=$(echo    "$cluster_row" | jq -r '.[1]')
+  PORT=$(echo        "$cluster_row" | jq -r '.[2]')
+  ENGINE_VER=$(echo  "$cluster_row" | jq -r '.[3]')
+  MULTI_AZ=$(echo    "$cluster_row" | jq -r '.[4]')
+  INSTANCE_ID=$(echo "$cluster_row" | jq -r '.[5]')
 
   log "============================================================"
-  log "Cluster: $CLUSTER_ID | Endpoint: $ENDPOINT:$PORT | v$ENGINE_VER"
+  log "Cluster: $CLUSTER_ID | $ENDPOINT:$PORT | v$ENGINE_VER"
 
-  # Busca credenciais se não foram passadas por variável de ambiente
+  # Credenciais
   if [[ -z "$DOCDB_USER" || -z "$DOCDB_PASS" ]]; then
     fetch_credentials "$CLUSTER_ID"
   fi
-
   if [[ -z "$DOCDB_USER" || -z "$DOCDB_PASS" ]]; then
     log "AVISO: credenciais não encontradas para $CLUSTER_ID — pulando."
     continue
   fi
 
-  # Coleta métricas via CloudWatch (instância primária)
-  log "Coletando métricas CloudWatch..."
-  INSTANCE_ID=$(echo "$cluster_row" | jq -r '.[5]')
-  END_TIME=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-  START_TIME=$(date -u -d '7 days ago' +%Y-%m-%dT%H:%M:%SZ 2>/dev/null \
-    || date -u -v-7d   +%Y-%m-%dT%H:%M:%SZ)  # macOS fallback
+  # -------------------------------------------------------------------
+  # Conectividade: túnel SSM ou direto
+  # -------------------------------------------------------------------
+  CONNECT_HOST="$ENDPOINT"
+  CONNECT_PORT="$PORT"
+  TLS_EXTRA_OPTS=""
+  TUNNEL_PID_CURRENT=""
 
-  get_cw_metric() {
+  if [[ -n "$EC2_INSTANCE_ID" ]]; then
+    log "Abrindo túnel SSM: localhost:$LOCAL_PORT → $ENDPOINT:$PORT"
+    TUNNEL_PID_CURRENT=$(open_tunnel "$ENDPOINT" "$PORT" "$LOCAL_PORT") || {
+      LOCAL_PORT=$((LOCAL_PORT + 1))
+      continue
+    }
+    CONNECT_HOST="localhost"
+    CONNECT_PORT="$LOCAL_PORT"
+    # Hostname do cert não bate com localhost — segurança mantida pelo túnel SSM
+    TLS_EXTRA_OPTS="&tlsAllowInvalidHostnames=true"
+  fi
+
+  # -------------------------------------------------------------------
+  # CloudWatch — métricas de instância e de cluster
+  # -------------------------------------------------------------------
+  log "Coletando métricas CloudWatch..."
+  END_TIME=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+  START_TIME=$(date -u -v-7d +%Y-%m-%dT%H:%M:%SZ 2>/dev/null \
+            || date -u -d '7 days ago' +%Y-%m-%dT%H:%M:%SZ)
+
+  get_cw_instance_metric() {
     local metric="$1"
     aws cloudwatch get-metric-statistics \
       --region "$AWS_REGION" \
       --namespace "AWS/DocDB" \
       --metric-name "$metric" \
       --dimensions Name=DBInstanceIdentifier,Value="$INSTANCE_ID" \
-      --start-time "$START_TIME" \
-      --end-time   "$END_TIME" \
-      --period 3600 \
-      --statistics Average Maximum \
-      --query 'sort_by(Datapoints, &Timestamp)[-1].[Average,Maximum]' \
+      --start-time "$START_TIME" --end-time "$END_TIME" \
+      --period 3600 --statistics Average Maximum \
+      --query 'sort_by(Datapoints, &Timestamp)[-1].[Average, Maximum]' \
       --output json 2>/dev/null || echo "[0,0]"
   }
 
-  CW_CPU=$(get_cw_metric "CPUUtilization")
-  CW_MEM=$(get_cw_metric "FreeableMemory")
-  CW_IOPS=$(get_cw_metric "VolumeReadIOPs")
-  CW_CONN=$(get_cw_metric "DatabaseConnections")
+  get_cw_cluster_metric() {
+    local metric="$1"
+    aws cloudwatch get-metric-statistics \
+      --region "$AWS_REGION" \
+      --namespace "AWS/DocDB" \
+      --metric-name "$metric" \
+      --dimensions Name=DBClusterIdentifier,Value="$CLUSTER_ID" \
+      --start-time "$START_TIME" --end-time "$END_TIME" \
+      --period 3600 --statistics Average Maximum \
+      --query 'sort_by(Datapoints, &Timestamp)[-1].[Average, Maximum]' \
+      --output json 2>/dev/null || echo "[0,0]"
+  }
 
-  # Coleta métricas internas via mongosh
-  log "Conectando ao cluster e coletando métricas de bancos/coleções..."
-  CONN_STRING="mongodb://${DOCDB_USER}:${DOCDB_PASS}@${ENDPOINT}:${PORT}/?tls=true&tlsCAFile=${TLS_CA_FILE}&retryWrites=false"
+  CW_CPU=$(get_cw_instance_metric "CPUUtilization")
+  CW_MEM=$(get_cw_instance_metric "FreeableMemory")
+  CW_IOPS=$(get_cw_cluster_metric "VolumeReadIOPs")   # dimensão cluster (correto)
+  CW_CONN=$(get_cw_instance_metric "DatabaseConnections")
 
-  MONGO_OUT=$("$MONGO_BIN" "$CONN_STRING" --quiet --eval "$MONGO_SCRIPT" 2>/dev/null) || {
+  # -------------------------------------------------------------------
+  # Coleta via mongosh
+  # -------------------------------------------------------------------
+  log "Conectando em $CONNECT_HOST:$CONNECT_PORT..."
+  CONN_STRING="mongodb://${DOCDB_USER}:${DOCDB_PASS}@${CONNECT_HOST}:${CONNECT_PORT}/?tls=true&tlsCAFile=${TLS_CA_FILE}&retryWrites=false${TLS_EXTRA_OPTS}"
+
+  # Script JS em arquivo temporário — mais robusto que --eval para scripts grandes
+  MONGO_JS_TMP=$(mktemp /tmp/docdb_sizing_XXXXXX.js)
+  MONGO_ERR_TMP=$(mktemp /tmp/docdb_sizing_err_XXXXXX.txt)
+  echo "$MONGO_SCRIPT" > "$MONGO_JS_TMP"
+
+  MONGO_OUT=$("$MONGO_BIN" "$CONN_STRING" --quiet --norc --file "$MONGO_JS_TMP" \
+              2>"$MONGO_ERR_TMP") || {
     log "AVISO: falha ao conectar em $CLUSTER_ID"
+    log "  $(head -3 "$MONGO_ERR_TMP" | tr '\n' ' ')"
+    log "  Verifique: credenciais, conectividade de rede/VPC e Security Group"
+    rm -f "$MONGO_JS_TMP" "$MONGO_ERR_TMP"
+    [[ -n "$TUNNEL_PID_CURRENT" ]] && kill "$TUNNEL_PID_CURRENT" 2>/dev/null || true
+    LOCAL_PORT=$((LOCAL_PORT + 1))
     continue
   }
 
-  # Salva JSON bruto por cluster
+  # Extrai apenas o bloco JSON — ignora banners do mongosh emitidos antes do output
+  MONGO_JSON=$(echo "$MONGO_OUT" | awk '/^\{/{found=1} found{print}')
+  echo "$MONGO_JSON" | python3 -m json.tool >/dev/null 2>&1 || MONGO_JSON="$MONGO_OUT"
+
+  rm -f "$MONGO_JS_TMP" "$MONGO_ERR_TMP"
+
+  # -------------------------------------------------------------------
+  # Salva JSON por cluster
+  # -------------------------------------------------------------------
   CLUSTER_FILE="$OUTPUT_DIR/${CLUSTER_ID}.json"
-  echo "$MONGO_OUT" | jq \
-    --arg cluster_id "$CLUSTER_ID" \
-    --arg endpoint   "$ENDPOINT" \
-    --arg port       "$PORT" \
-    --arg engine_ver "$ENGINE_VER" \
-    --arg multi_az   "$MULTI_AZ" \
+  echo "$MONGO_JSON" | jq \
+    --arg  cluster_id "$CLUSTER_ID" \
+    --arg  endpoint   "$ENDPOINT" \
+    --arg  port       "$PORT" \
+    --arg  engine_ver "$ENGINE_VER" \
+    --arg  multi_az   "$MULTI_AZ" \
     --argjson cw_cpu  "$CW_CPU" \
     --argjson cw_mem  "$CW_MEM" \
     --argjson cw_iops "$CW_IOPS" \
@@ -242,26 +342,39 @@ echo "$CLUSTERS" | jq -c '.[]' | while IFS= read -r cluster_row; do
       engine_ver:  $engine_ver,
       multi_az:    $multi_az,
       cloudwatch: {
-        cpu_avg_pct:     $cw_cpu[0],
-        cpu_max_pct:     $cw_cpu[1],
-        free_mem_avg_mb: ($cw_mem[0] / 1048576),
-        iops_avg:        $cw_iops[0],
-        connections_avg: $cw_conn[0]
+        cpu_avg_pct:     ($cw_cpu[0]  // 0),
+        cpu_max_pct:     ($cw_cpu[1]  // 0),
+        free_mem_avg_mb: (($cw_mem[0] // 0) / 1048576),
+        iops_avg:        ($cw_iops[0] // 0),
+        connections_avg: ($cw_conn[0] // 0)
       },
       data: .
     }' > "$CLUSTER_FILE"
 
   log "Salvo: $CLUSTER_FILE"
-done
+  CLUSTER_FILES+=("$CLUSTER_FILE")
+
+  # Fecha túnel deste cluster e avança porta para o próximo
+  [[ -n "$TUNNEL_PID_CURRENT" ]] && kill "$TUNNEL_PID_CURRENT" 2>/dev/null || true
+  LOCAL_PORT=$((LOCAL_PORT + 1))
+
+done < <(echo "$CLUSTERS" | jq -c '.[]')
 
 # ---------------------------------------------------------------------------
-# CONSOLIDA TODOS OS ARQUIVOS EM UM RELATÓRIO ÚNICO
+# CONSOLIDA RELATÓRIO
 # ---------------------------------------------------------------------------
 log "Consolidando relatório final..."
-jq -s '.' "$OUTPUT_DIR"/*.json > "$REPORT_FILE" 2>/dev/null || true
+
+if [[ ${#CLUSTER_FILES[@]} -eq 0 ]]; then
+  log "AVISO: nenhum cluster coletado. Verifique conectividade e credenciais."
+  log "  Dica: se estiver fora da VPC, defina EC2_INSTANCE_ID=<id-da-instancia-na-vpc>"
+  exit 1
+fi
+
+jq -s '.' "${CLUSTER_FILES[@]}" > "$REPORT_FILE"
 
 # ---------------------------------------------------------------------------
-# GERA CSV RESUMO (nível collection)
+# CSV — resumo por collection
 # ---------------------------------------------------------------------------
 log "Gerando CSV de resumo (collections)..."
 echo "cluster_id,database,collection,doc_count,size_mb,storage_mb,avg_doc_kb,index_size_mb,index_count" > "$CSV_FILE"
@@ -274,7 +387,9 @@ jq -r '.[] |
   [$cid, $db, .name, .doc_count, .size_mb, .storage_mb, .avg_doc_kb, .index_size_mb, .index_count] |
   @csv' "$REPORT_FILE" >> "$CSV_FILE" 2>/dev/null || true
 
-# CSV detalhado de índices (uma linha por índice)
+# ---------------------------------------------------------------------------
+# CSV — detalhe de índices
+# ---------------------------------------------------------------------------
 INDEX_CSV="$OUTPUT_DIR/indexes_detail.csv"
 log "Gerando CSV detalhado de índices..."
 echo "cluster_id,database,collection,index_name,composition,fields,directions,unique,sparse,ttl_seconds,partial_filter" > "$INDEX_CSV"
@@ -287,28 +402,29 @@ jq -r '.[] |
   .name as $coll |
   .indexes[] |
   [
-    $cid,
-    $db,
-    $coll,
-    .name,
-    .composition_str,
-    .fields_str,
+    $cid, $db, $coll, .name, .composition_str, .fields_str,
     (.directions | join(" | ")),
-    (.unique     | tostring),
-    (.sparse     | tostring),
-    (.expireAfterSeconds | if . == null then "" else tostring end),
+    (.unique  | tostring),
+    (.sparse  | tostring),
+    (.expireAfterSeconds      | if . == null then "" else tostring end),
     (.partialFilterExpression | if . == null then "" else tostring end)
-  ] |
-  @csv' "$REPORT_FILE" >> "$INDEX_CSV" 2>/dev/null || true
+  ] | @csv' "$REPORT_FILE" >> "$INDEX_CSV" 2>/dev/null || true
 
 # ---------------------------------------------------------------------------
-# SUMÁRIO NO TERMINAL
+# SUMÁRIO
 # ---------------------------------------------------------------------------
 log "============================================================"
 log "SUMÁRIO"
 log "============================================================"
-jq -r '.[] | "Cluster: \(.cluster_id)\n  CPU avg/max: \(.cloudwatch.cpu_avg_pct | floor)% / \(.cloudwatch.cpu_max_pct | floor)%\n  Conexões avg: \(.cloudwatch.connections_avg | floor)\n  Databases: \(.data.databases | length)\n  Collections: \(.data.databases[].collections | length) (por db)\n"' \
-  "$REPORT_FILE" 2>/dev/null || log "(sem dados para exibir)"
+jq -r '.[] |
+  "Cluster: \(.cluster_id)
+  CPU avg/max:   \(.cloudwatch.cpu_avg_pct    // 0 | floor)% / \(.cloudwatch.cpu_max_pct // 0 | floor)%
+  Mem livre avg: \(.cloudwatch.free_mem_avg_mb // 0 | floor) MB
+  IOPS avg:      \(.cloudwatch.iops_avg        // 0 | floor)
+  Conexões avg:  \(.cloudwatch.connections_avg // 0 | floor)
+  Databases:     \(.data.databases | length)
+  Collections:   \([.data.databases[].collections | length] | add // 0) (total)
+"' "$REPORT_FILE" 2>/dev/null || log "(sem dados — verifique conectividade e credenciais)"
 
 log "Arquivos gerados em: $OUTPUT_DIR"
 log "  Relatório JSON : $REPORT_FILE"
