@@ -1,10 +1,11 @@
-# collect_documentdb_sizing.sh
+# collect_documentdb_sizing
 
-Script bash de código aberto, disponibilizado exclusivamente como exemplo, para coleta completa de métricas de sizing de clusters Amazon DocumentDB, com foco em subsidiar processos de migração e dimensionamento para MongoDB Atlas.
+Script bash de código aberto para coleta completa de métricas de sizing de clusters Amazon DocumentDB, com foco em subsidiar processos de migração e dimensionamento para MongoDB Atlas.
 
 Combina AWS CLI v2 — para descoberta de clusters e coleta de métricas no CloudWatch — com mongosh — para coleta interna de databases, collections e índices — sem dependências adicionais além dessas ferramentas.
 
 Este material é fornecido apenas para fins de referência. Sua utilização, adaptação e execução são de inteira responsabilidade do usuário. Os desenvolvedores e mantenedores deste código não assumem qualquer responsabilidade por problemas, falhas, impactos, perdas ou danos decorrentes de seu uso, inclusive em ambientes de teste ou produção.
+
 ---
 
 ## O que é coletado
@@ -20,7 +21,7 @@ Este material é fornecido apenas para fins de referência. Sua utilização, ad
 
 | Campo | Descrição |
 |---|---|
-| `size_mb` | Tamanho dos dados (dataSize) em MB |
+| `size_mb` | Tamanho dos dados em MB (`storageSize` — o DocumentDB não expõe `dataSize`) |
 | `storage_mb` | Tamanho em disco (storageSize) em MB |
 | `index_size_mb` | Tamanho total dos índices em MB |
 
@@ -28,7 +29,7 @@ Este material é fornecido apenas para fins de referência. Sua utilização, ad
 
 | Campo | Descrição |
 |---|---|
-| `doc_count` | Quantidade de documentos |
+| `doc_count` | Quantidade de documentos ativos (documentos expirados por TTL não são contados) |
 | `size_mb` | Tamanho dos dados em MB |
 | `storage_mb` | Tamanho em disco em MB |
 | `avg_doc_kb` | Tamanho médio de documento em KB |
@@ -50,14 +51,14 @@ Este material é fornecido apenas para fins de referência. Sua utilização, ad
 
 ### Métricas CloudWatch coletadas
 
-| Métrica | Estatísticas | Namespace |
-|---|---|---|
-| `CPUUtilization` | Average, Maximum | `AWS/DocDB` |
-| `FreeableMemory` | Average | `AWS/DocDB` |
-| `VolumeReadIOPs` | Average | `AWS/DocDB` |
-| `DatabaseConnections` | Average | `AWS/DocDB` |
+| Métrica | Dimensão | Estatísticas | Namespace |
+|---|---|---|---|
+| `CPUUtilization` | DBInstanceIdentifier | Average, Maximum | `AWS/DocDB` |
+| `FreeableMemory` | DBInstanceIdentifier | Average | `AWS/DocDB` |
+| `VolumeReadIOPs` | DBClusterIdentifier | Average | `AWS/DocDB` |
+| `DatabaseConnections` | DBInstanceIdentifier | Average | `AWS/DocDB` |
 
-> As métricas são coletadas por **instância primária** de cada cluster com granularidade horária nos últimos **7 dias**.
+> As métricas são coletadas pela **instância primária** de cada cluster com granularidade horária nos últimos **7 dias**.
 
 ---
 
@@ -69,6 +70,8 @@ Este material é fornecido apenas para fins de referência. Sua utilização, ad
 | `mongosh` | qualquer | [mongodb.com/try/download/shell](https://www.mongodb.com/try/download/shell) |
 | `jq` | 1.6+ | `apt install jq` / `yum install jq` / `brew install jq` |
 | `curl` | qualquer | Pré-instalado na maioria dos sistemas |
+| `python3` | 3.x | Pré-instalado na maioria dos sistemas |
+| `session-manager-plugin` | qualquer | Apenas se usar modo túnel SSM — ver seção abaixo |
 
 ### Permissões IAM necessárias
 
@@ -79,9 +82,9 @@ Este material é fornecido apenas para fins de referência. Sua utilização, ad
     {
       "Effect": "Allow",
       "Action": [
-        "rds:DescribeDBClusters",
-        "secretsmanager:GetSecretValue",
-        "cloudwatch:GetMetricStatistics"
+        "docdb:DescribeDBClusters",
+        "cloudwatch:GetMetricStatistics",
+        "secretsmanager:GetSecretValue"
       ],
       "Resource": "*"
     }
@@ -89,15 +92,51 @@ Este material é fornecido apenas para fins de referência. Sua utilização, ad
 }
 ```
 
-> `secretsmanager:GetSecretValue` é necessário apenas se as credenciais forem gerenciadas via AWS Secrets Manager. Caso contrário, pode ser omitida.
+> `secretsmanager:GetSecretValue` é necessário apenas se as credenciais forem gerenciadas via AWS Secrets Manager.
+> `ssm:StartSession` é necessário apenas no modo túnel SSM.
 
 > Todas as ações são **somente leitura**. Nenhuma escrita ou modificação é realizada nos clusters.
 
-### Conectividade de rede
+---
 
-- A máquina que executar o script precisa ter acesso à **porta 27017** (ou a porta configurada) dos clusters DocumentDB
-- Se os clusters estiverem em **VPC privada**, execute a partir de uma instância EC2 na mesma VPC ou via **AWS Systems Manager Session Manager**
-- O **Security Group** do cluster deve permitir inbound na porta do cluster a partir do IP ou SG da máquina de coleta
+## Conectividade de rede
+
+O DocumentDB **não possui endpoint público** — por design da AWS, só é acessível de dentro da VPC. O script suporta dois modos de conectividade, selecionados automaticamente pela variável `EC2_INSTANCE_ID`:
+
+| Situação | Modo | O que fazer |
+|---|---|---|
+| Rodando em EC2 / EKS / Lambda na mesma VPC | **Direto** | Não define `EC2_INSTANCE_ID` |
+| Tem VPN ou Direct Connect para a VPC | **Direto** | Não define `EC2_INSTANCE_ID` |
+| Máquina local sem VPN (laptop, CI externo) | **Túnel SSM** | Define `EC2_INSTANCE_ID=<id-de-ec2-na-vpc>` |
+
+### Modo túnel SSM
+
+Quando `EC2_INSTANCE_ID` está definido, o script abre automaticamente um túnel SSM para cada cluster e conecta via `localhost`, sem necessidade de SSH key ou VPN.
+
+**Pré-requisito do túnel:**
+
+```bash
+# macOS
+brew install --cask session-manager-plugin
+
+# Linux — consulte:
+# https://docs.aws.amazon.com/systems-manager/latest/userguide/session-manager-working-with-install-plugin.html
+```
+
+**Permissão IAM adicional para o túnel:**
+
+```json
+{
+  "Effect": "Allow",
+  "Action": ["ssm:StartSession"],
+  "Resource": "*"
+}
+```
+
+**Requisito na EC2 usada como ponto de salto:**
+- Ter o SSM Agent ativo (padrão em Amazon Linux 2 / 2023)
+- Ter a policy `AmazonSSMManagedInstanceCore` na role da instância
+- Ter acesso de rede ao Security Group do DocumentDB na porta 27017
 
 ---
 
@@ -105,8 +144,8 @@ Este material é fornecido apenas para fins de referência. Sua utilização, ad
 
 ```bash
 git clone <repo-url>
-cd <repo>
-chmod +x collect_documentdb_sizing.sh
+cd documentdb-sizing
+chmod +x collect_documentdb_sizing
 ```
 
 ### Certificado TLS
@@ -124,20 +163,32 @@ export TLS_CA_FILE=/tmp/global-bundle.pem
 
 ## Uso
 
-```bash
-# Configuração mínima — credenciais via variável de ambiente
-DOCDB_USER=admin DOCDB_PASS='suaSenha' AWS_REGION=us-east-1 \
-  ./collect_documentdb_sizing.sh
+### Modo direto — dentro da VPC ou com VPN
 
-# Com credenciais no AWS Secrets Manager (padrão automático)
+```bash
+# Credenciais via variável de ambiente
+DOCDB_USER=admin DOCDB_PASS='suaSenha' AWS_REGION=us-east-1 \
+  ./collect_documentdb_sizing
+
+# Credenciais via AWS Secrets Manager (padrão automático)
 # O script busca o secret: docdb/<cluster-id>/credentials
-# Campos esperados: { "username": "...", "password": "..." }
-AWS_REGION=sa-east-1 ./collect_documentdb_sizing.sh
+AWS_REGION=sa-east-1 ./collect_documentdb_sizing
 
 # Com perfil AWS específico
 AWS_PROFILE=minha-conta AWS_REGION=us-east-1 \
-  ./collect_documentdb_sizing.sh
+  ./collect_documentdb_sizing
 ```
+
+### Modo túnel SSM — máquina local sem VPN
+
+```bash
+# Define EC2_INSTANCE_ID com o ID de uma instância EC2 na mesma VPC do DocumentDB
+EC2_INSTANCE_ID=i-0abc1234def567890 \
+DOCDB_USER=admin DOCDB_PASS='suaSenha' AWS_REGION=us-east-1 \
+  ./collect_documentdb_sizing
+```
+
+O script abre um túnel SSM por cluster automaticamente, coleta os dados e encerra os túneis ao final.
 
 ### Variáveis de ambiente
 
@@ -148,6 +199,8 @@ AWS_PROFILE=minha-conta AWS_REGION=us-east-1 \
 | `DOCDB_PASS` | _(vazio)_ | Senha do DocumentDB |
 | `TLS_CA_FILE` | `/tmp/global-bundle.pem` | Caminho para o certificado TLS da AWS |
 | `AWS_PROFILE` | _(default)_ | Perfil do AWS CLI a utilizar |
+| `EC2_INSTANCE_ID` | _(vazio)_ | ID de EC2 na VPC para túnel SSM (modo local sem VPN) |
+| `SSM_TUNNEL_BASE_PORT` | `47017` | Porta local inicial para os túneis SSM |
 
 ### Credenciais via Secrets Manager
 
@@ -234,6 +287,14 @@ my-cluster,orders,transactions,session_ttl,"sessionToken:ASC",sessionToken,ASC,f
 
 ## Troubleshooting
 
+**Script não retorna nada / "nenhum cluster coletado"**
+
+A causa mais comum é falta de conectividade de rede com o DocumentDB (que não tem endpoint público).
+
+- Se estiver fora da VPC sem VPN: defina `EC2_INSTANCE_ID` para usar o modo túnel SSM
+- Verifique se as credenciais estão corretas (`DOCDB_USER` / `DOCDB_PASS`)
+- Confirme que o Security Group do cluster permite inbound na porta 27017
+
 **`MongoServerError: not authorized`**
 
 O usuário não tem permissão de leitura. Conceda o role mínimo necessário:
@@ -256,6 +317,21 @@ ls -la $TLS_CA_FILE
 curl -sSL https://truststore.pki.rds.amazonaws.com/global/global-bundle.pem \
      -o /tmp/global-bundle.pem
 ```
+
+**`session-manager-plugin not found`** (modo túnel SSM)
+
+```bash
+# macOS
+brew install --cask session-manager-plugin
+```
+
+**Túnel SSM falha ao abrir**
+
+Verifique o log gerado em `docdb_sizing_*/ssm_tunnel_<cluster>.log`. Causas comuns:
+
+- A EC2 não tem o SSM Agent ativo ou não tem a policy `AmazonSSMManagedInstanceCore`
+- A EC2 não tem acesso de rede ao endpoint do DocumentDB
+- O documento `AWS-StartPortForwardingSessionToRemoteHost` não está disponível na região
 
 **`An error occurred (AccessDeniedException)` — Secrets Manager**
 
@@ -295,8 +371,11 @@ brew install mongosh
 
 ## Notas
 
-- O script é **somente leitura** e não realiza nenhuma alteração nos clusters ou databases
+- O script é **somente leitura** — nenhuma escrita ou modificação é realizada nos clusters ou databases
 - Databases de sistema (`admin`, `local`, `config`, `system`) são automaticamente ignorados
+- O DocumentDB não retorna `dataSize` em `db.stats()` — o campo `size_mb` usa `storageSize` como substituto
+- Collections com TTL index podem apresentar `doc_count` menor que o total inserido — documentos expirados já foram removidos pelo DocumentDB
 - Em clusters com muitas collections, a execução pode levar alguns minutos por cluster
-- As métricas CloudWatch usam granularidade **horária** com janela de **7 dias** — suficiente para identificar picos de workload
-- Em ambientes **Multi-AZ**, o script coleta métricas apenas da instância primária
+- As métricas CloudWatch usam granularidade **horária** com janela de **7 dias**
+- Em ambientes **Multi-AZ**, as métricas são coletadas apenas da instância primária
+- `iops_avg` pode aparecer como `0` em clusters recém-criados — o CloudWatch leva algumas horas para acumular datapoints
